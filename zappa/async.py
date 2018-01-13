@@ -101,6 +101,12 @@ from .utilities import get_topic_name
 # Need to check wether we need the encoding or not for the SNS payload
 import sys
 PY2 = (sys.version_info[0] == 2)
+# https://github.com/Miserlou/Zappa/issues/1332
+if PY2:
+    unicode = unicode
+else:
+    unicode = str
+
 
 try:
     from zappa_settings import ASYNC_RESPONSE_TABLE
@@ -134,7 +140,8 @@ class LambdaAsyncResponse(object):
     Base Response Dispatcher class
     Can be used directly or subclassed if the method to send the message is changed.
     """
-    def __init__(self, lambda_function_name=None, aws_region=None, capture_response=False, **kwargs):
+    def __init__(self, lambda_function_name=None, aws_region=None,
+                 capture_response=False, callback=None, **kwargs):
         """ """
         if kwargs.get('boto_session'):
             self.client = kwargs.get('boto_session').client('lambda')
@@ -159,7 +166,16 @@ class LambdaAsyncResponse(object):
             self.response_id = None
 
         self.capture_response = capture_response
+        self._set_callback(callback)
 
+    def _set_callback(self, callback):
+        if callback is not None:
+            self.callback = True
+            self.callback_func = callback
+            self.callback_lambda = os.environ.get('AWS_LAMBDA_FUNCTION_NAME')
+            self.callback_region = os.environ.get('AWS_REGION')
+        else:
+            self.callback = False
 
     def send(self, task_path, args, kwargs):
         """
@@ -169,9 +185,14 @@ class LambdaAsyncResponse(object):
                 'task_path': task_path,
                 'capture_response': self.capture_response,
                 'response_id': self.response_id,
+                'callback': self.callback,
                 'args': args,
                 'kwargs': kwargs
             }
+        if self.callback:
+            message.update({'callback_func': self.callback_func,
+                            'callback_lambda': self.callback_lambda,
+                            'callback_region': self.callback_region})
         self._send(message)
         return self
 
@@ -195,7 +216,8 @@ class SnsAsyncResponse(LambdaAsyncResponse):
     Send a SNS message to a specified SNS topic
     Serialise the func path and arguments
     """
-    def __init__(self, lambda_function_name=None, aws_region=None, capture_response=False, **kwargs):
+    def __init__(self, lambda_function_name=None, aws_region=None,
+                 capture_response=False, callback=None, **kwargs):
 
         self.lambda_function_name = lambda_function_name
         self.aws_region=aws_region
@@ -239,7 +261,7 @@ class SnsAsyncResponse(LambdaAsyncResponse):
             self.response_id = None
 
         self.capture_response = capture_response
-
+        self._set_callback(callback)
 
     def _send(self, message):
         """
@@ -276,7 +298,8 @@ def route_lambda_task(event, context):
     imports the function, calls the function with args
     """
     message = event
-    return run_message(message)
+    # provide the context
+    return run_message(context, message)
 
 
 def route_sns_task(event, context):
@@ -288,10 +311,11 @@ def route_sns_task(event, context):
     message = json.loads(
             record['Sns']['Message']
         )
-    return run_message(message)
+    # provide the context
+    return run_message(context, message)
 
 
-def run_message(message):
+def run_message(context, message):
     """
     Runs a function defined by a message object with keys:
     'task_path', 'args', and 'kwargs' used by lambda routing
@@ -305,33 +329,68 @@ def run_message(message):
                 'ttl': {'N': str(int(time.time()+600))},
                 'async_status': {'S': 'in progress'},
                 'async_response': {'S': str(json.dumps('N/A'))},
+                'request_id': {'S': str(context.aws_request_id)},
+                'log_group_name': {'S': str(context.log_group_name)},
+                'stream_name': {'S': str(context.log_stream_name)}
             }
         )
 
     func = import_and_get_task(message['task_path'])
-    if hasattr(func, 'sync'):
-        response = func.sync(
-            *message['args'],
-            **message['kwargs']
-        )
-    else:
-        response = func(
-            *message['args'],
-            **message['kwargs']
-        )
+    try:
+        if hasattr(func, 'sync'):
+            response = func.sync(
+                *message['args'],
+                **message['kwargs']
+            )
+        else:
+            response = func(
+                *message['args'],
+                **message['kwargs']
+            )
 
-    if message.get('capture_response', False):
-        DYNAMODB_CLIENT.update_item(
-            TableName=ASYNC_RESPONSE_TABLE,
-            Key={'id': {'S': str(message['response_id'])}},
-            UpdateExpression="SET async_response = :r, async_status = :s",
-            ExpressionAttributeValues={
-                ':r': {'S': str(json.dumps(response))},
-                ':s': {'S': 'complete'},
-            },
-        )
+        if message.get('capture_response', False):
+            DYNAMODB_CLIENT.update_item(
+                TableName=ASYNC_RESPONSE_TABLE,
+                Key={'id': {'S': str(message['response_id'])}},
+                UpdateExpression="SET async_response = :r, async_status = :s",
+                ExpressionAttributeValues={
+                    ':r': {'S': str(json.dumps(response))},
+                    ':s': {'S': 'complete'},
+                },
+            )
 
-    return response
+        return response
+
+    except Exception as err:
+        if message.get('capture_response', False):
+            DYNAMODB_CLIENT.update_item(
+                TableName=ASYNC_RESPONSE_TABLE,
+                Key={'id': {'S': str(message['response_id'])}},
+                UpdateExpression="SET async_response = :r, async_status = :s",
+                ExpressionAttributeValues={
+                    ':r': {'S': str(err)},
+                    ':s': {'S': 'error'},
+                },
+            )
+        raise
+
+    finally:
+        #callback
+        if message.get('callback', False):
+            func_name = message['callback_func']
+            lambda_name = message['callback_lambda']
+            lambda_region = message['callback_region']
+            if message['response_id']:
+                run(func_name, kwargs={'response_id': message['response_id']},
+                    remote_aws_lambda_function_name=lambda_name,
+                    remote_aws_region=lambda_region,
+                    callback=None) #cannot callback on a callback!
+            else:
+                run(func_name,
+                    remote_aws_lambda_function_name=lambda_name,
+                    remote_aws_region=lambda_region,
+                    callback=None) #cannot callback on a callback!
+
 
 ##
 # Execution interfaces and classes
@@ -339,7 +398,8 @@ def run_message(message):
 
 
 def run(func, args=[], kwargs={}, service='lambda', capture_response=False,
-        remote_aws_lambda_function_name=None, remote_aws_region=None, **task_kwargs):
+        remote_aws_lambda_function_name=None, remote_aws_region=None,
+        callback=None, **task_kwargs):
     """
     Instead of decorating a function with @task, you can just run it directly.
     If you were going to do func(*args, **kwargs), then you will call this:
@@ -360,6 +420,7 @@ def run(func, args=[], kwargs={}, service='lambda', capture_response=False,
     return ASYNC_CLASSES[service](lambda_function_name=lambda_function_name,
                                   aws_region=aws_region,
                                   capture_response=capture_response,
+                                  callback=callback,
                                   **task_kwargs).send(task_path, args, kwargs)
 
 
@@ -467,13 +528,18 @@ def import_and_get_task(task_path):
 
 def get_func_task_path(func):
     """
-    Format the modular task path for a function via inspection.
+    Format the modular task path for a function via inspection if param is
+    a function. If the param is of type string, it will simply return it.
     """
+    # https://github.com/Miserlou/Zappa/issues/1332
+    if isinstance(func, (str, unicode)):
+        return func
+
     module_path = inspect.getmodule(func).__name__
     task_path = '{module_path}.{func_name}'.format(
-                                        module_path=module_path,
-                                        func_name=func.__name__
-                                    )
+        module_path=module_path,
+        func_name=func.__name__
+    )
     return task_path
 
 
@@ -491,4 +557,7 @@ def get_async_response(response_id):
     return {
         'status': response['Item']['async_status']['S'],
         'response': json.loads(response['Item']['async_response']['S']),
+        'request_id': response['Item']['request_id']['S'],
+        'log_group_name': response['Item']['log_group_name']['S'],
+        'stream_name': response['Item']['stream_name']['S']
     }
